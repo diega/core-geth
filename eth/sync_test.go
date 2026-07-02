@@ -157,6 +157,66 @@ func testSnapSyncDisabling(t *testing.T, ethVer uint, snapVer uint) {
 	}
 }
 
+// Tests that marking the node as synced before the chain made any progress does
+// not disable snap sync. Mining being enabled at startup (--mine) lifts the
+// transaction rejection long before the first sync cycle runs, and that used to
+// silently downgrade a snap syncing node to a full sync it could never complete
+// (the chain has no state to build on), OOM-looping on the resulting deep reorg.
+func TestSnapSyncStaysEnabledOnStatelessChain(t *testing.T) {
+	t.Parallel()
+
+	// Create an empty chain with a handler in snap sync mode
+	db := rawdb.NewMemoryDatabase()
+	gspec := &genesisT.Genesis{
+		Config: params.TestChainConfig,
+		Alloc:  genesisT.GenesisAlloc{testAddr: {Balance: big.NewInt(1000000)}},
+	}
+	core.MustCommitGenesis(db, triedb.NewDatabase(db, nil), gspec)
+
+	chain, _ := core.NewBlockChain(db, nil, gspec, nil, ethash.NewFaker(), vm.Config{}, nil, nil)
+	defer chain.Stop()
+
+	handler, err := newHandler(&handlerConfig{
+		Database:   db,
+		Merger:     consensus.NewMerger(db),
+		Chain:      chain,
+		TxPool:     newTestTxPool(),
+		Network:    1,
+		Sync:       downloader.SnapSync,
+		BloomCache: 1,
+	})
+	if err != nil {
+		t.Fatalf("failed to create handler: %v", err)
+	}
+	handler.Start(1000)
+	defer handler.Stop()
+
+	if !handler.snapSync.Load() {
+		t.Fatalf("snap sync disabled on pristine blockchain")
+	}
+	// Mark the node as synced while the chain is still stateless, as StartMining
+	// (via SetSynced) used to do, and ensure snap sync stays enabled.
+	handler.enableSyncedFeatures()
+
+	if !handler.synced.Load() {
+		t.Fatalf("node not marked as synced")
+	}
+	if !handler.snapSync.Load() {
+		t.Fatalf("snap sync disabled while the chain is still stateless")
+	}
+	// Once the chain progressed past genesis, a completed sync cycle may
+	// legitimately turn snap sync off.
+	bs, _ := core.GenerateChain(params.TestChainConfig, chain.Genesis(), ethash.NewFaker(), db, 4, nil)
+	if _, err := chain.InsertChain(bs); err != nil {
+		t.Fatalf("failed to insert chain: %v", err)
+	}
+	handler.enableSyncedFeatures()
+
+	if handler.snapSync.Load() {
+		t.Fatalf("snap sync not disabled after the chain progressed")
+	}
+}
+
 func TestArtificialFinalityFeatureEnablingDisabling(t *testing.T) {
 	maxBlocksCreated := 1024
 	genFunc := blockGenContemporaryTime(int64(maxBlocksCreated))
