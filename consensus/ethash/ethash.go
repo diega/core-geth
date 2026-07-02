@@ -446,7 +446,7 @@ func (d *dataset) generate(dir string, limit int, lock bool, test bool) {
 
 		d.dump, d.mmap, d.dataset, err = memoryMapAndGenerate(path, dsize, lock, func(buffer []uint32) { generateDataset(buffer, d.epoch, d.epochLength, cache) })
 		if err != nil {
-			logger.Error("Failed to generate mapped ethash dataset", "err", err)
+			logger.Error("Failed to generate mapped ethash dataset, falling back to in-memory generation: the entire DAG will be held in RAM and regenerated on every restart, which can OOM the node; make sure the DAG directory is writable (--ethash.dagdir)", "dir", dir, "sizeMB", dsize>>20, "err", err)
 
 			d.dataset = make([]uint32, dsize/4)
 			generateDataset(d.dataset, d.epoch, d.epochLength, cache)
