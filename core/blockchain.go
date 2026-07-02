@@ -2142,6 +2142,17 @@ func (bc *BlockChain) commonAncestor(a *types.Header, b *types.Header) (*types.H
 	return commonH, nil
 }
 
+// rewoundBlock is a lightweight (number, hash) reference to a block involved
+// in a reorg. Only these references are accumulated while walking the two
+// chains: a reorg may span a very large number of blocks (e.g. a full sync
+// reorging onto the leftover state of an old snap sync pivot), and retaining
+// the blocks — or even just the headers — for the whole span can run the node
+// out of memory.
+type rewoundBlock struct {
+	number uint64
+	hash   common.Hash
+}
+
 // reorg takes two blocks, an old chain and a new chain and will reconstruct the
 // blocks and inserts them to be part of the new canonical chain and accumulates
 // potential missing transactions and post an event about them.
@@ -2149,62 +2160,56 @@ func (bc *BlockChain) commonAncestor(a *types.Header, b *types.Header) (*types.H
 // externally.
 func (bc *BlockChain) reorg(oldHead *types.Header, newHead *types.Block) error {
 	var (
-		newChain    types.Blocks
-		oldChain    types.Blocks
-		commonBlock *types.Block
+		newChain     []rewoundBlock
+		oldChain     []rewoundBlock
+		commonHeader *types.Header
 
 		deletedTxs []common.Hash
 		addedTxs   []common.Hash
 	)
-	oldBlock := bc.GetBlock(oldHead.Hash(), oldHead.Number.Uint64())
-	if oldBlock == nil {
+	if bc.GetBlock(oldHead.Hash(), oldHead.Number.Uint64()) == nil {
 		return errors.New("current head block missing")
 	}
-	newBlock := newHead
+	oldHeader := oldHead
+	newHeader := newHead.Header()
 
 	// Reduce the longer chain to the same number as the shorter one
-	if oldBlock.NumberU64() > newBlock.NumberU64() {
-		// Old chain is longer, gather all transactions and logs as deleted ones
-		for ; oldBlock != nil && oldBlock.NumberU64() != newBlock.NumberU64(); oldBlock = bc.GetBlock(oldBlock.ParentHash(), oldBlock.NumberU64()-1) {
-			oldChain = append(oldChain, oldBlock)
-			for _, tx := range oldBlock.Transactions() {
-				deletedTxs = append(deletedTxs, tx.Hash())
-			}
+	if oldHeader.Number.Uint64() > newHeader.Number.Uint64() {
+		// Old chain is longer, gather all its blocks for deletion
+		for ; oldHeader != nil && oldHeader.Number.Uint64() != newHeader.Number.Uint64(); oldHeader = bc.GetHeader(oldHeader.ParentHash, oldHeader.Number.Uint64()-1) {
+			oldChain = append(oldChain, rewoundBlock{oldHeader.Number.Uint64(), oldHeader.Hash()})
 		}
 	} else {
-		// New chain is longer, stash all blocks away for subsequent insertion
-		for ; newBlock != nil && newBlock.NumberU64() != oldBlock.NumberU64(); newBlock = bc.GetBlock(newBlock.ParentHash(), newBlock.NumberU64()-1) {
-			newChain = append(newChain, newBlock)
+		// New chain is longer, stash all block references away for subsequent insertion
+		for ; newHeader != nil && newHeader.Number.Uint64() != oldHeader.Number.Uint64(); newHeader = bc.GetHeader(newHeader.ParentHash, newHeader.Number.Uint64()-1) {
+			newChain = append(newChain, rewoundBlock{newHeader.Number.Uint64(), newHeader.Hash()})
 		}
 	}
-	if oldBlock == nil {
+	if oldHeader == nil {
 		return errInvalidOldChain
 	}
-	if newBlock == nil {
+	if newHeader == nil {
 		return errInvalidNewChain
 	}
 	// Both sides of the reorg are at the same number, reduce both until the common
 	// ancestor is found
 	for {
 		// If the common ancestor was found, bail out
-		if oldBlock.Hash() == newBlock.Hash() {
-			commonBlock = oldBlock
+		if oldHeader.Hash() == newHeader.Hash() {
+			commonHeader = oldHeader
 			break
 		}
 		// Remove an old block as well as stash away a new block
-		oldChain = append(oldChain, oldBlock)
-		for _, tx := range oldBlock.Transactions() {
-			deletedTxs = append(deletedTxs, tx.Hash())
-		}
-		newChain = append(newChain, newBlock)
+		oldChain = append(oldChain, rewoundBlock{oldHeader.Number.Uint64(), oldHeader.Hash()})
+		newChain = append(newChain, rewoundBlock{newHeader.Number.Uint64(), newHeader.Hash()})
 
 		// Step back with both chains
-		oldBlock = bc.GetBlock(oldBlock.ParentHash(), oldBlock.NumberU64()-1)
-		if oldBlock == nil {
+		oldHeader = bc.GetHeader(oldHeader.ParentHash, oldHeader.Number.Uint64()-1)
+		if oldHeader == nil {
 			return errInvalidOldChain
 		}
-		newBlock = bc.GetBlock(newBlock.ParentHash(), newBlock.NumberU64()-1)
-		if newBlock == nil {
+		newHeader = bc.GetHeader(newHeader.ParentHash, newHeader.Number.Uint64()-1)
+		if newHeader == nil {
 			return errInvalidNewChain
 		}
 	}
@@ -2217,20 +2222,20 @@ func (bc *BlockChain) reorg(oldHead *types.Header, newHead *types.Block) error {
 			msg = "Large chain reorg detected"
 			logFn = log.Warn
 		}
-		logFn(msg, "number", commonBlock.Number(), "hash", commonBlock.Hash(),
-			"drop", len(oldChain), "dropfrom", oldChain[0].Hash(), "add", len(newChain), "addfrom", newChain[0].Hash())
+		logFn(msg, "number", commonHeader.Number, "hash", commonHeader.Hash(),
+			"drop", len(oldChain), "dropfrom", oldChain[0].hash, "add", len(newChain), "addfrom", newChain[0].hash)
 		blockReorgAddMeter.Mark(int64(len(newChain)))
 		blockReorgDropMeter.Mark(int64(len(oldChain)))
 		blockReorgMeter.Mark(1)
 	} else if len(newChain) > 0 {
 		// Special case happens in the post merge stage that current head is
 		// the ancestor of new head while these two blocks are not consecutive
-		log.Info("Extend chain", "add", len(newChain), "number", newChain[0].Number(), "hash", newChain[0].Hash())
+		log.Info("Extend chain", "add", len(newChain), "number", newChain[0].number, "hash", newChain[0].hash)
 		blockReorgAddMeter.Mark(int64(len(newChain)))
 	} else {
 		// len(newChain) == 0 && len(oldChain) > 0
 		// rewind the canonical chain to a lower point.
-		log.Error("Impossible reorg, please file an issue", "oldnum", oldBlock.Number(), "oldhash", oldBlock.Hash(), "oldblocks", len(oldChain), "newnum", newBlock.Number(), "newhash", newBlock.Hash(), "newblocks", len(newChain))
+		log.Error("Impossible reorg, please file an issue", "oldnum", oldHeader.Number, "oldhash", oldHeader.Hash(), "oldblocks", len(oldChain), "newnum", newHeader.Number, "newhash", newHeader.Hash(), "newblocks", len(newChain))
 	}
 	// Reset the tx lookup cache in case to clear stale txlookups.
 	// This is done before writing any new chain data to avoid the
@@ -2239,14 +2244,31 @@ func (bc *BlockChain) reorg(oldHead *types.Header, newHead *types.Block) error {
 	bc.txLookupCache.Purge()
 
 	// Insert the new chain(except the head block(reverse order)),
-	// taking care of the proper incremental order.
+	// taking care of the proper incremental order. The blocks are loaded one by
+	// one from the database: only their (number, hash) references were retained
+	// while walking the chains, to keep the memory usage of deep reorgs bounded.
 	for i := len(newChain) - 1; i >= 1; i-- {
+		newBlock := bc.GetBlock(newChain[i].hash, newChain[i].number)
+		if newBlock == nil {
+			return errInvalidNewChain // Corrupt database, mostly here to avoid weird panics
+		}
 		// Insert the block in the canonical way, re-writing history
-		bc.writeHeadBlock(newChain[i])
+		bc.writeHeadBlock(newBlock)
 
 		// Collect the new added transactions.
-		for _, tx := range newChain[i].Transactions() {
+		for _, tx := range newBlock.Transactions() {
 			addedTxs = append(addedTxs, tx.Hash())
+		}
+	}
+	// Collect the transactions of the replaced canonical blocks, loading the
+	// bodies lazily for the same memory reason as above.
+	for _, old := range oldChain {
+		oldBlock := bc.GetBlock(old.hash, old.number)
+		if oldBlock == nil {
+			return errInvalidOldChain // Corrupt database, mostly here to avoid weird panics
+		}
+		for _, tx := range oldBlock.Transactions() {
+			deletedTxs = append(deletedTxs, tx.Hash())
 		}
 	}
 
@@ -2262,9 +2284,9 @@ func (bc *BlockChain) reorg(oldHead *types.Header, newHead *types.Block) error {
 	// Delete all hash markers that are not part of the new canonical chain.
 	// Because the reorg function does not handle new chain head, all hash
 	// markers greater than or equal to new chain head should be deleted.
-	number := commonBlock.NumberU64()
+	number := commonHeader.Number.Uint64()
 	if len(newChain) > 1 {
-		number = newChain[1].NumberU64()
+		number = newChain[1].number
 	}
 	for i := number + 1; ; i++ {
 		hash := rawdb.ReadCanonicalHash(bc.db, i)
@@ -2284,11 +2306,15 @@ func (bc *BlockChain) reorg(oldHead *types.Header, newHead *types.Block) error {
 	// Deleted logs + blocks:
 	var deletedLogs []*types.Log
 	for i := len(oldChain) - 1; i >= 0; i-- {
+		oldBlock := bc.GetBlock(oldChain[i].hash, oldChain[i].number)
+		if oldBlock == nil {
+			return errInvalidOldChain // Corrupt database, mostly here to avoid weird panics
+		}
 		// Also send event for blocks removed from the canon chain.
-		bc.chainSideFeed.Send(ChainSideEvent{Block: oldChain[i]})
+		bc.chainSideFeed.Send(ChainSideEvent{Block: oldBlock})
 
 		// Collect deleted logs for notification
-		if logs := bc.collectLogs(oldChain[i], true); len(logs) > 0 {
+		if logs := bc.collectLogs(oldBlock, true); len(logs) > 0 {
 			deletedLogs = append(deletedLogs, logs...)
 		}
 		if len(deletedLogs) > 512 {
@@ -2303,7 +2329,11 @@ func (bc *BlockChain) reorg(oldHead *types.Header, newHead *types.Block) error {
 	// New logs:
 	var rebirthLogs []*types.Log
 	for i := len(newChain) - 1; i >= 1; i-- {
-		if logs := bc.collectLogs(newChain[i], false); len(logs) > 0 {
+		newBlock := bc.GetBlock(newChain[i].hash, newChain[i].number)
+		if newBlock == nil {
+			return errInvalidNewChain // Corrupt database, mostly here to avoid weird panics
+		}
+		if logs := bc.collectLogs(newBlock, false); len(logs) > 0 {
 			rebirthLogs = append(rebirthLogs, logs...)
 		}
 		if len(rebirthLogs) > 512 {
