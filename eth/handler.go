@@ -763,8 +763,11 @@ func (h *handler) enableSyncedFeatures() {
 	h.synced.Store(true)
 
 	// If we were running snap sync and it finished, disable doing another
-	// round on next sync cycle
-	if h.snapSync.Load() {
+	// round on next sync cycle. Never disable it while the chain is still
+	// stateless though: callers can mark the node synced before the first
+	// sync cycle ever ran (e.g. SetSynced), and turning snap sync off at
+	// that point would force a full sync that has no state to build on.
+	if h.snapSync.Load() && h.chain.CurrentBlock().Number.Uint64() > 0 {
 		log.Info("Snap sync complete, auto disabling")
 		h.snapSync.Store(false)
 	}

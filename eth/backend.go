@@ -510,8 +510,12 @@ func (s *Ethereum) StartMining(threads int) error {
 			cli.Authorize(eb, wallet.SignData)
 		}
 		// If mining is started, we can disable the transaction rejection mechanism
-		// introduced to speed sync times.
-		s.handler.enableSyncedFeatures()
+		// introduced to speed sync times, but without declaring the initial sync
+		// finished: mining is enabled at node startup (--mine), long before the
+		// first sync cycle runs, and enableSyncedFeatures would silently disable
+		// a requested snap sync, downgrading the node to a full sync it may never
+		// be able to complete.
+		s.handler.synced.Store(true)
 
 		go s.miner.Start()
 	}
