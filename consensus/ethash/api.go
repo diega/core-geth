@@ -17,7 +17,9 @@
 package ethash
 
 import (
+	"encoding/json"
 	"errors"
+	"strings"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
@@ -84,13 +86,51 @@ func (api *API) SubmitWork(nonce types.BlockNonce, hash, digest common.Hash) boo
 	return err == nil
 }
 
+// HashrateArg is the hash rate argument of SubmitHashrate.
+//
+// It decodes like hexutil.Uint64, except that it accepts leading zero
+// digits. Some mining software sends the rate left-padded to 32 bytes
+// ("0x0000...0500000"), which hexutil.Uint64 rejects (see core-geth #494).
+// The input is limited to 64 hex digits and the value must fit in 64 bits.
+type HashrateArg uint64
+
+var (
+	errHashrateNotString = errors.New("hashrate must be a JSON string")
+	errHashrateNoPrefix  = errors.New("hashrate must be a 0x-prefixed hex string")
+	errHashrateTooLong   = errors.New("hashrate longer than 32 bytes")
+)
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (h *HashrateArg) UnmarshalJSON(input []byte) error {
+	var s string
+	if err := json.Unmarshal(input, &s); err != nil {
+		return errHashrateNotString
+	}
+	if len(s) < 3 || (s[:2] != "0x" && s[:2] != "0X") {
+		return errHashrateNoPrefix
+	}
+	digits := s[2:]
+	if len(digits) > 64 {
+		return errHashrateTooLong
+	}
+	if digits = strings.TrimLeft(digits, "0"); digits == "" {
+		digits = "0"
+	}
+	v, err := hexutil.DecodeUint64("0x" + digits)
+	if err != nil {
+		return err
+	}
+	*h = HashrateArg(v)
+	return nil
+}
+
 // SubmitHashrate can be used for remote miners to submit their hash rate.
 // This enables the node to report the combined hash rate of all miners
 // which submit work through this node.
 //
 // It accepts the miner hash rate and an identifier which must be unique
 // between nodes.
-func (api *API) SubmitHashrate(rate hexutil.Uint64, id common.Hash) bool {
+func (api *API) SubmitHashrate(rate HashrateArg, id common.Hash) bool {
 	if api.ethash.remote == nil {
 		return false
 	}

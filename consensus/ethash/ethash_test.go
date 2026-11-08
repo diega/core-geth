@@ -405,7 +405,7 @@ func TestRemoteSealer(t *testing.T) {
 
 func TestHashrate(t *testing.T) {
 	var (
-		hashrate = []hexutil.Uint64{100, 200, 300}
+		hashrate = []HashrateArg{100, 200, 300}
 		expect   uint64
 		ids      = []common.Hash{common.HexToHash("a"), common.HexToHash("b"), common.HexToHash("c")}
 	)
@@ -438,7 +438,7 @@ func TestClosedRemoteSealer(t *testing.T) {
 		t.Error("expect to return an error to indicate ethash is stopped")
 	}
 
-	if res := api.SubmitHashrate(hexutil.Uint64(100), common.HexToHash("a")); res {
+	if res := api.SubmitHashrate(HashrateArg(100), common.HexToHash("a")); res {
 		t.Error("expect to return false when submit hashrate to a stopped ethash")
 	}
 }
